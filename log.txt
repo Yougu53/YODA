@@ -1,132 +1,130 @@
-Total frames: 2868924
+Total frames: 2859346
 Unique labels: ['AscendingStairs' 'Cycling' 'DescendingStairs' 'Ironing' 'Lying'
  'NordicWalking' 'Other' 'RopeJumping' 'Running' 'Sitting' 'Standing'
  'VacuumCleaning' 'Walking']
-Generated 35 windows.
+Generated 349 windows.
 Starting training...
-Epoch 1/50, Loss: 3.8180
-Epoch 2/50, Loss: 3.6652
-Epoch 3/50, Loss: 3.5153
-Epoch 4/50, Loss: 3.3666
-Epoch 5/50, Loss: 3.2226
-Epoch 6/50, Loss: 3.0935
-Epoch 7/50, Loss: 2.9947
-Epoch 8/50, Loss: 2.9364
-Epoch 9/50, Loss: 2.9141
-Epoch 10/50, Loss: 2.9077
-Epoch 11/50, Loss: 2.8915
-Epoch 12/50, Loss: 2.8558
-Epoch 13/50, Loss: 2.8086
-Epoch 14/50, Loss: 2.7623
-Epoch 15/50, Loss: 2.7245
-Epoch 16/50, Loss: 2.6972
-Epoch 17/50, Loss: 2.6787
-Epoch 18/50, Loss: 2.6660
-Epoch 19/50, Loss: 2.6566
-Epoch 20/50, Loss: 2.6488
-Epoch 21/50, Loss: 2.6416
-Epoch 22/50, Loss: 2.6347
-Epoch 23/50, Loss: 2.6276
-Epoch 24/50, Loss: 2.6200
-Epoch 25/50, Loss: 2.6116
-Epoch 26/50, Loss: 2.6027
-Epoch 27/50, Loss: 2.5943
-Epoch 28/50, Loss: 2.5871
-Epoch 29/50, Loss: 2.5811
-Epoch 30/50, Loss: 2.5756
-Epoch 31/50, Loss: 2.5697
-Epoch 32/50, Loss: 2.5629
-Epoch 33/50, Loss: 2.5554
-Epoch 34/50, Loss: 2.5480
-Epoch 35/50, Loss: 2.5414
-Epoch 36/50, Loss: 2.5356
-Epoch 37/50, Loss: 2.5303
-Epoch 38/50, Loss: 2.5249
-Epoch 39/50, Loss: 2.5190
-Epoch 40/50, Loss: 2.5128
-Epoch 41/50, Loss: 2.5063
-Epoch 42/50, Loss: 2.4999
-Epoch 43/50, Loss: 2.4936
-Epoch 44/50, Loss: 2.4876
-Epoch 45/50, Loss: 2.4817
-Epoch 46/50, Loss: 2.4759
-Epoch 47/50, Loss: 2.4702
-Epoch 48/50, Loss: 2.4645
-Epoch 49/50, Loss: 2.4587
-Epoch 50/50, Loss: 2.4527
+Training: Epoch 1/50, Loss: 27.5258
+Training: Epoch 2/50, Loss: 13.3955
+Training: Epoch 3/50, Loss: 9.3559
+Training: Epoch 4/50, Loss: 7.7691
+Training: Epoch 5/50, Loss: 6.9876
+Training: Epoch 6/50, Loss: 6.5540
+Training: Epoch 7/50, Loss: 6.2568
+Training: Epoch 8/50, Loss: 6.0325
+Training: Epoch 9/50, Loss: 5.8491
+Training: Epoch 10/50, Loss: 5.6897
+Training: Epoch 11/50, Loss: 5.5454
+Training: Epoch 12/50, Loss: 5.4129
+Training: Epoch 13/50, Loss: 5.2915
+Training: Epoch 14/50, Loss: 5.1775
+Training: Epoch 15/50, Loss: 5.0702
+Training: Epoch 16/50, Loss: 4.9689
+Training: Epoch 17/50, Loss: 4.8726
+Training: Epoch 18/50, Loss: 4.7813
+Training: Epoch 19/50, Loss: 4.6980
+Training: Epoch 20/50, Loss: 4.6243
+Training: Epoch 21/50, Loss: 4.5656
+Training: Epoch 22/50, Loss: 4.5830
+Training: Epoch 23/50, Loss: 4.6886
+Training: Epoch 24/50, Loss: 4.7141
+Training: Epoch 25/50, Loss: 4.4497
+Training: Epoch 26/50, Loss: 4.3526
+Training: Epoch 27/50, Loss: 4.2502
+Training: Epoch 28/50, Loss: 4.1697
+Training: Epoch 29/50, Loss: 4.0961
+Training: Epoch 30/50, Loss: 4.0246
+Training: Epoch 31/50, Loss: 3.9667
+Training: Epoch 32/50, Loss: 3.9002
+Training: Epoch 33/50, Loss: 3.8507
+Training: Epoch 34/50, Loss: 3.8006
+Training: Epoch 35/50, Loss: 3.7528
+Training: Epoch 36/50, Loss: 3.7203
+Training: Epoch 37/50, Loss: 3.7000
+Training: Epoch 38/50, Loss: 3.6595
+Training: Epoch 39/50, Loss: 3.6201
+Training: Epoch 40/50, Loss: 3.5995
+Training: Epoch 41/50, Loss: 3.5964
+Training: Epoch 42/50, Loss: 3.5699
+Training: Epoch 43/50, Loss: 3.5730
+Training: Epoch 44/50, Loss: 3.5274
+Training: Epoch 45/50, Loss: 3.5052
+Training: Epoch 46/50, Loss: 3.4590
+Training: Epoch 47/50, Loss: 3.4030
+Training: Epoch 48/50, Loss: 3.3429
+Training: Epoch 49/50, Loss: 3.3108
+Training: Epoch 50/50, Loss: 3.2546
 evaluate training set
-
-=== Segment-Level Evaluation ===
-Total windows evaluated: 28
-Windows with no ground-truth segments:   0
-Windows with no predictions:   0
-Total ground-truth segments:   280
-Total predicted segments:      59
-Matched segments:              37
-
-Precision:                     0.627
-Recall:                        0.132
-F1 Score:                      0.218
-Best IoU:                      0.989
-Mean IoU:                      0.129
-
-=== Classification Report for Segments ===
                   precision    recall  f1-score   support
 
- AscendingStairs       0.00      0.00      0.00        12
-         Cycling       0.00      0.00      0.00        12
-DescendingStairs       0.00      0.00      0.00        14
-         Ironing       0.00      0.00      0.00        22
-           Lying       0.00      0.00      0.00        19
-   NordicWalking       0.00      0.00      0.00        14
-           Other       0.35      1.00      0.52        96
-     RopeJumping       0.00      0.00      0.00         4
-         Running       0.00      0.00      0.00        10
-         Sitting       0.00      0.00      0.00        19
-        Standing       1.00      0.30      0.46        20
-  VacuumCleaning       0.00      0.00      0.00        18
-         Walking       1.00      0.10      0.18        20
+ AscendingStairs       0.26      0.11      0.15     95112
+         Cycling       0.79      0.85      0.82    116391
+DescendingStairs       0.37      0.09      0.14     83664
+         Ironing       0.77      0.81      0.79    205526
+           Lying       0.81      0.53      0.64    168340
+   NordicWalking       0.82      0.81      0.81    128647
+           Other       0.56      0.83      0.66    730797
+     RopeJumping       0.99      0.48      0.65     33722
+         Running       0.97      0.80      0.88     76793
+         Sitting       0.74      0.73      0.73    162128
+        Standing       0.53      0.29      0.38    164640
+  VacuumCleaning       0.67      0.45      0.54    151025
+         Walking       0.90      0.72      0.80    168783
 
-        accuracy                           0.37       280
-       macro avg       0.18      0.11      0.09       280
-    weighted avg       0.26      0.37      0.22       280
+        accuracy                           0.66   2285568
+       macro avg       0.71      0.58      0.61   2285568
+    weighted avg       0.67      0.66      0.64   2285568
 
+
+=== Segment-Level Evaluation ===
+Total ground-truth segments:   276
+Total predicted segments:      173
+Matched segments:              119
+
+Precision:                     0.688
+Recall:                        0.431
+F1 Score:                      0.530
+Best IoU:                      1.000
+Mean IoU:                      0.407
+C:\Users\15092\CptS700\data\pamap2\data\Protocol\yoda_with_detection_boxes.py:735: UserWarning: The figure layout has changed to tight
+  plt.tight_layout()
 evaluate testing set
-
-=== Segment-Level Evaluation ===
-Total windows evaluated: 7
-Windows with no ground-truth segments:   0
-Windows with no predictions:   0
-Total ground-truth segments:   70
-Total predicted segments:      15
-Matched segments:              9
-
-Precision:                     0.600
-Recall:                        0.129
-F1 Score:                      0.212
-Best IoU:                      0.745
-Mean IoU:                      0.119
-
-=== Classification Report for Segments ===
+C:\Users\15092\AppData\Local\Programs\Python\Python310\lib\site-packages\sklearn\metrics\_classification.py:1471: UndefinedMetricWarning: Precision and F-score are ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, msg_start, len(result))
+C:\Users\15092\AppData\Local\Programs\Python\Python310\lib\site-packages\sklearn\metrics\_classification.py:1471: UndefinedMetricWarning: Precision and F-score are ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, msg_start, len(result))
+C:\Users\15092\AppData\Local\Programs\Python\Python310\lib\site-packages\sklearn\metrics\_classification.py:1471: UndefinedMetricWarning: Precision and F-score are ill-defined and being set to 0.0 in labels with no predicted samples. Use `zero_division` parameter to control this behavior.
+  _warn_prf(average, modifier, msg_start, len(result))
                   precision    recall  f1-score   support
 
- AscendingStairs       0.00      0.00      0.00         3
-         Cycling       0.00      0.00      0.00         4
-DescendingStairs       0.00      0.00      0.00         2
-         Ironing       0.00      0.00      0.00         4
-           Lying       0.00      0.00      0.00         2
-   NordicWalking       0.00      0.00      0.00         6
-           Other       0.41      1.00      0.58        28
-     RopeJumping       0.00      0.00      0.00         2
-         Running       0.00      0.00      0.00         2
-         Sitting       0.00      0.00      0.00         3
-        Standing       1.00      0.33      0.50         3
-  VacuumCleaning       0.00      0.00      0.00         3
-         Walking       0.00      0.00      0.00         8
+ AscendingStairs       0.00      0.00      0.00     22068
+         Cycling       0.42      0.96      0.58     48147
+DescendingStairs       0.00      0.00      0.00     21275
+         Ironing       0.00      0.00      0.00     32941
+           Lying       0.77      0.95      0.85     24165
+   NordicWalking       0.00      0.00      0.00     57477
+           Other       0.40      0.38      0.39    196379
+     RopeJumping       0.00      0.00      0.00     15121
+         Running       0.15      0.41      0.22     19882
+         Sitting       0.31      0.89      0.46     22899
+        Standing       0.20      0.00      0.01     25137
+  VacuumCleaning       0.25      0.94      0.39     24269
+         Walking       0.92      0.48      0.63     63680
 
-        accuracy                           0.41        70
-       macro avg       0.11      0.10      0.08        70
-    weighted avg       0.21      0.41      0.25        70
+        accuracy                           0.39    573440
+       macro avg       0.26      0.39      0.27    573440
+    weighted avg       0.34      0.39      0.33    573440
 
-C:\Users\15092\CptS700\data\pamap2\al-data\Protocol\yoda_with_detection_boxes.py:546: UserWarning: The figure layout has changed to tight
+
+=== Segment-Level Evaluation ===
+Total ground-truth segments:   68
+Total predicted segments:      65
+Matched segments:              21
+
+Precision:                     0.323
+Recall:                        0.309
+F1 Score:                      0.316
+Best IoU:                      1.000
+Mean IoU:                      0.271
+C:\Users\15092\CptS700\data\pamap2\data\Protocol\yoda_with_detection_boxes.py:735: UserWarning: The figure layout has changed to tight
   plt.tight_layout()

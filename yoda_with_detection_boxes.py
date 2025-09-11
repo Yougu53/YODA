@@ -1,5 +1,6 @@
 from collections import deque
 import glob
+import math
 import pandas as pd
 import numpy as np
 import torch
@@ -26,9 +27,12 @@ EPOCHS = 50
 MODEL_PATH = "yoda_model.pt"
 ENCODER_PATH = "label_encoder.pkl"
 NUM_DETECTORS = 10
-WINDOW_SIZE = 81920
-STRIDE = 81920
-def load_and_window_data(csv_files, window_size, stride, num_detectors):
+WINDOW_SIZE = 8192
+STRIDE = 8192
+ANCHOR_BOXES = torch.tensor([[0.5], [1.0], [2.0]]).to(device)
+NUM_ANCHORS = len(ANCHOR_BOXES)
+
+def load_and_window_data(csv_files, window_size, stride, num_detectors, anchors):
     
     # TODO: Include time information?
     all_X, all_Y, all_labels = [], [], []
@@ -68,7 +72,7 @@ def load_and_window_data(csv_files, window_size, stride, num_detectors):
         segments_for_window = frame_labels_to_segments(y_win, label_encoder)
 
         # Put segments in detection boxes and get the detections array:
-        detections_for_window = segments_to_detections(segments_for_window, label_encoder, window_size, num_detectors)
+        detections_for_window = segments_to_detections(segments_for_window, label_encoder, window_size, num_detectors, anchors)
 
         X_windows.append(x_win)
         Y_windows.append(detections_for_window)
@@ -81,75 +85,117 @@ def frame_labels_to_segments(y_window, le):
     """
     Find a list of all activity segments in the window of labels. A segment is defined as a continuous set of frames
     (labels) with the same label.
-    For each segment, the center frame, duration, and class ID (from the label encoder) are stored.
+    For each segment, the start frame, duration, and class ID (from the label encoder) are stored.
 
     Note that this includes "Other" (or other background labels) as their own segment.
 
     :param y_window: the set of labels for all frames in the window
     :param le: label encoder
-    :return: a list of tuples of (start, end, class_id) of all segments in the window
+    :return: a list of tuples of (confidence, start frame index, frame duration, and class_id) of all segments in the window
     """
     segments = []
-    if len(y_window) == 0:
-        return segments
     current_label = y_window[0]
     start = 0
     for i in range(1, len(y_window)):
         if y_window[i] != current_label:
+            end = i
+            duration = end - start
             class_id = le.transform([current_label])[0]
-            segments.append((start, i-1, class_id))
+            segments.append((start, duration, class_id))
             start = i
             current_label = y_window[i]
-
     end = len(y_window)
+    duration = end - start
     class_id = le.transform([current_label])[0]
-    segments.append((start, end, class_id))
+    segments.append((start, duration, class_id))
     return segments
 
+def segments_to_detections(segments_for_window, le, window_size, num_detectors, anchors, background_label = 'Other'):
+    """
+    Convert list of activity segments into detection cell outputs for the window.
 
-def segments_to_detections(segments_for_window, le, window_size, num_detectors, background_label="Other"):
+    Divides the window into specified number of detection cells. Each segment is placed within the detection cell which
+    contains the segment's midpoint. For that detection cell, the target vector will consist of values:
+    [p_c, t_x, t_w, c_1, c_2, ..., c_N] where
+     - p_c is the confidence of there being a segment in that cell (in this case, 1.0)
+     - t_x is the center point location of the segment (from the start of the detection cell), as a fraction of the
+        cell's total width [0.0-1.0]
+     - t_w is the log-space width of the segment, defined as ln(segment_width / cell_width)
+        - this is used as it is more stable than necessarily using the raw width ratio - large and small widths will
+          be closer in log-sapce
+     - c_1, c_2, ..., c_N are one-hot-encoded class label (from the label encoder) - the position corresponding to the
+        class label of the segment is set to 1, all others to 0
+        N is the number of class labels stored in the label encoder (may contain the background label class)
+
+    These output vectors are combined into a (num_detectors x (3+N)) array, with each row corresponding to the ith
+    detection cell.
+
+    If background_label is set, that label is considered background, and so its segments are not assigned to detectors.
+    # TODO: Fix the number of classes N to not include "Other" label as one of the slots
+
+    (Note: If multiple segments have midpoints in the same cell, only the last of those segments will be included. This
+    is something that would be fixed with different bounding boxes in each detector.)
+
+    :param segments_for_window: list of (confidence, start frame index, frame duration, and class_id) segments
+    :param le: the label encoder
+    :param window_size: number of frames in the window
+    :param num_detectors: number of detection cells to use
+    :param anchors: scaled durations of activities
+    :param background_label: label that is considered "background" (i.e. segments ignored) - defaults to Other
+    :return: a (num_detectors x (3+N)) array of detection cells labels for the window
+    """
+
     num_classes = len(le.classes_)
-    detections = np.zeros((num_detectors, 3 + num_classes), dtype=np.float32)
-    box_width = window_size / num_detectors
-    bg_index = le.transform([background_label])[0]
+    num_anchors = len(anchors)
+    detections = np.zeros((num_detectors, num_anchors, 4 + num_classes), dtype=np.float32)  # one row for each detection [num_detectors, num_anchors, 4 + num_classes]
 
-    for i in range(num_detectors):
-        box_start = int(i * box_width)
-        box_end = int((i + 1) * box_width)
-        
-        best_iou = 0.0
-        best_segment = None
+    cell_width = window_size // num_detectors  # (round down to nearest integer)
+    # TODO: Handle window size not an exact multiple of the number of detectors
 
-        for (seg_start, seg_end, seg_class) in segments_for_window:
-            inter_start = max(box_start, seg_start)
-            inter_end = min(box_end, seg_end)
-            inter = max(0, inter_end - inter_start)
-            union = (box_end - box_start) + (seg_end - seg_start) - inter
-            iou = inter / union if union > 0 else 0.0
+    # Get index of background label to ignore if set:
+    background_label_index: int | None = None
+    if background_label is not None and background_label in le.classes_:
+        background_label_index = le.transform([background_label])[0]
 
-            if iou > best_iou:
-                best_iou = iou
-                best_segment = (seg_start, seg_end, seg_class)
+    # Now assign each segment to a detection cell:
+    for start, duration, class_id in segments_for_window:
+        if class_id == background_label_index:
+            # Ignore this segment, as it's background label
+            continue
 
-        if best_segment is not None:
-            seg_start, seg_end, seg_class = best_segment
-            seg_center = (seg_start + seg_end) / 2
-            seg_width = seg_end - seg_start
-            # p_c
-            detections[i, 0] = best_iou
-            # b_x
-            detections[i, 1] = (seg_center - box_start) / box_width
-            # b_w
-            detections[i, 2] = seg_width / box_width
-            # One-hot encoded class label
-            detections[i, 3 + seg_class] = 1.0
+        # Determine the midpoint of the segment:
+        midpoint = start + duration // 2
 
-        else:
-            # No segment found, this is a background box
-            detections[i, 0] = 0.0
-            detections[i, 1] = 0.5  # Center
-            detections[i, 2] = 1.0  # Full width
-            detections[i, 3 + bg_index] = 1.0
+        # Find the detection cell the midpoint is in:
+        for i in range(num_detectors):
+            cell_start = cell_width * i
+            cell_end = cell_start + cell_width
+
+            if cell_start <= midpoint < cell_end:
+                # Segment midpoint belongs to the ith cell:
+                # Determine the best anchor for this segment
+                segment_width_ratio = duration / cell_width
+                intersection = torch.min(torch.tensor(segment_width_ratio), anchors.squeeze())
+                union = torch.tensor(segment_width_ratio) + anchors.squeeze() - intersection
+                ious = intersection / (union + 1e-6)
+                best_anchor_idx = torch.argmax(ious).item()
+                p_c = 1.0  # confidence
+                t_x = (midpoint - cell_start) / cell_width
+                t_w = np.log(duration / (anchors[best_anchor_idx].item() * cell_width) + 1e-16)
+
+                # Create the class section, with the class id marked as 1:
+                c = [0] * num_classes
+                c[class_id] = 1
+                # Check if an anchor in this cell is already assigned
+                if detections[i, best_anchor_idx, 0] == 0:
+                    detections[i, best_anchor_idx] = [p_c, t_x, t_w, 1.0] + c
+                
+                
+                break  # move to next segment
+
+        # TODO: Fix this
+        # # If we get this far, no detection box was found (maybe due to window_size / detection_size not being integer)?
+        # raise RuntimeError(f'No detection box found for segment index {seg_index} of class ID {class_id}')
 
     return detections
 
@@ -163,47 +209,46 @@ class YodaSensorDataset(Dataset):
 
     def __getitem__(self, idx):
         x_tensor = torch.tensor(self.X[idx]).transpose(0, 1)  # [features, time]
-        y_tensor = torch.tensor(self.Y[idx])  # [num_detectors, detection_array]
+        y_tensor = torch.tensor(self.Y[idx])  # [num_detectors, num_anchors, detection_array]
 
         return x_tensor, y_tensor
 
 class Yoda(nn.Module):
-    def __init__(self, input_channels, num_classes, num_detectors):
+    def __init__(self, input_channels, num_classes, num_detectors, num_anchors):
         super().__init__()
-
+        self.num_anchors = num_anchors
         self.num_classes = num_classes
         self.num_detectors = num_detectors
-        kernal = 5
-        self.conv1 = nn.Conv1d(input_channels, 64, kernel_size=kernal, padding=1)
-        self.conv2 = nn.Conv1d(64, 128, kernel_size=kernal, padding=1)
+        # The output size for each anchor: 1 (confidence) + 1 (center_x) + 1 (width) + 1 (objectness) + num_classes
+        self.num_outputs_per_anchor = 4 + self.num_classes
+        self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm1d(32)
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm1d(64)
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
+        self.bn4 = nn.BatchNorm1d(256)
         self.pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(128, num_detectors * (3+num_classes))
+        self.fc = nn.Linear(256, num_detectors * num_anchors * self.num_outputs_per_anchor)
 
     def forward(self, x):
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = torch.relu(self.bn3(self.conv3(x)))
+        x = torch.relu(self.bn4(self.conv4(x)))
         x = self.pool(x).squeeze(-1)
         x = self.fc(x)
-        logits = x.view(-1, self.num_detectors, 3 + self.num_classes)  # [batch, num_detectors, 3 + num_classes] - each item in 2nd dimension is a detection output
+        logits = x.view(-1, self.num_detectors, self.num_anchors, self.num_outputs_per_anchor)
 
-        # Use activation on the logits to get values:
-        # TODO: Can use 0:1, 1:2, 2:3, to not need to unsqueeze the individual pieces?
-        p_c = torch.clamp(logits[..., 0], 0, 1)  # limit confidence to [0, 1], encourage a higher congidence score, not using sigmoid
+        """ p_c = torch.clamp(logits[..., 0], 0, 1)  # limit confidence to [0, 1], encourage a higher congidence score, not using sigmoid
         b_x = torch.sigmoid(logits[..., 1])  # box location in [0, 1]
         b_w = torch.exp(torch.clamp(logits[..., 2], min=-5, max=5))  # box width allowed to be exponential
         class_probs = torch.softmax(logits[..., 3:], dim=-1)  # softmax the class probabilities to sum to 1 Assume that an object belongs to one class use sigmoid in v3
 
-        detections = torch.cat((p_c.unsqueeze(-1), b_x.unsqueeze(-1), b_w.unsqueeze(-1), class_probs), dim=-1)
+        detections = torch.cat((p_c.unsqueeze(-1), b_x.unsqueeze(-1), b_w.unsqueeze(-1), class_probs), dim=-1) """
 
-        return logits, detections
-
-
-# TODO: What loss used in regular YOLO?
-#   Per Copilot, seems to be mix of localization loss (CIoU), Binary Cross-Entropy of confidence score, and BC-E of
-#   class prediction
-# TODO: Need to use non-max suppression for the bounding boxes of segments (see Coursera video)
-#   We should do this for the whole segment (all activities at once), not just per-activity? Or at least when we expect
-#   (read: enforce) one activity at a time?
+        return logits
 
 
 class YODALoss(nn.Module):
@@ -214,15 +259,18 @@ class YODALoss(nn.Module):
      - Classification loss (compare predicted to actual class predictions)
     """
 
-    def __init__(self, lambda_localization=5.0, lambda_noobj=0.1):
+    def __init__(self, lambda_localization=5.0, lambda_noseg=0.5):
         """
         Initialize the loss
         :param lambda_localization: scalar for the localization component of loss
-        :param lambda_noobj: scalar for the confidence loss when no target is present
+        :param lambda_noseg: scalar for the confidence loss when no segment is present in that cell
         """
         super().__init__()
         self.lambda_localization = lambda_localization
-        self.lambda_noobj = lambda_noobj
+        self.lambda_noseg = lambda_noseg
+        # Set up losses (use reduction = none so parts of loss can be summed then averaged over entire batch size
+        self.bce_loss = nn.BCEWithLogitsLoss(reduction='none')  # use with logits as the output of the model is not scaled by sigmoid
+        self.mse_loss = nn.MSELoss(reduction='none')
 
     def forward(self, pred, target):
         """
@@ -231,57 +279,56 @@ class YODALoss(nn.Module):
         Each should be a tensor of dimensions (batch_size, # boxes, 3 + num_classes)
         Where the last dimension consists of:
         [p_c, b_x, b_w, class_probs]
+        [p_c, t_x, t_w, c_1, c_2, ..., c_N]
+        and none of the values have been scaled (i.e. raw model output, not passed through sigmoid/etc)
         """
 
         # Determine which cells have a segment target assigned (ground-truth p_c > 0):
         target_mask = target[..., 0] > 0
-
+        
+        # Objectness (confidence) loss:
+        # Compute the BCE loss separately for the cases where there is a segment in the target vs those where there is
+        # not. This is comparing the p_c of the prediction (probability of a segment detected in the cell) against the
+        # ground_truth p_c (which is either 1 or 0):
+        conf_loss_with_segment = self.bce_loss(pred[..., 0], target[..., 0]) * target_mask  # mult by target mask to only include ones with segment targets
+        conf_loss_without_segment = self.bce_loss(pred[..., 0], target[..., 0]) * ~target_mask
+        confidence_loss = conf_loss_with_segment.sum() + self.lambda_noseg * conf_loss_without_segment.sum()
         # Localization loss:
-        # Compute the MSE loss of the predicted locations and widths of segments (b_x and b_w),
-        # only for those cells which have a detected target
-        # TODO: Use sqrt for the width
-        localization_loss = torch.tensor(0.)
-        if target_mask.any():  # only compute if at least one box with target
-            # Compute the part of the loss from target location relative to box (b_x):
-            localization_loss = nn.MSELoss()(pred[..., 1:2][target_mask], target[..., 1:2][target_mask])
+        # Compute the loss separately for the segment center (t_x) values and the log-space segment width (t_w) values
+        # Only include the cells where there is a target
 
-            # Compute the part of the loss from target width (b_w), using sqrt() to reduce skew of large boxes:
-            localization_loss += nn.MSELoss()(torch.sqrt(pred[..., 2:3][target_mask]), torch.sqrt(target[..., 2:3][target_mask]))
+        # For t_x, use BCE loss since the t_x value should be in [0, 1]
+        localization_loss_x = self.bce_loss(pred[..., 1], target[..., 1]) * target_mask
 
-        # Confidence loss:
-        # The confidence loss is the MSE of the confidence (p_c) for each box, but split into two parts: for boxes that
-        # are assigned to a segment in training, and a (scaled) amount for those that aren't assigned to a segment:
-        conf_loss_with_targets = torch.tensor(0.)
-        if target_mask.any():  # only compute if at least one box with target:
-            conf_loss_with_targets = nn.MSELoss()(pred[..., 0:1][target_mask], target[..., 0:1][target_mask])
-
-        conf_loss_no_targets = torch.tensor(0.)
-        if not target_mask.all():  # only compute if there is at least one non-target box
-            conf_loss_no_targets = nn.MSELoss()(pred[..., 0:1][~target_mask], target[..., 0:1][~target_mask])
-
+        # For t_w, use MSE loss since the t_w value can be unbounded:
+        localization_loss_w = self.mse_loss(pred[..., 2], target[..., 2]) * target_mask
+        localization_loss_a = self.mse_loss(pred[..., 3], target[..., 2]) * target_mask
         # Classification loss:
-        # Compute the MSE loss of class probabilities for boxes where there is a target:
-        class_loss = torch.tensor(0.)
-        if target_mask.any():  # only compute if at least one box with target:
-            class_loss = nn.MSELoss()(pred[..., 3:][target_mask], target[..., 3:][target_mask])
+        # Compute the loss as the BCE loss over the prediction values, only for cells with a target segment.
+        classification_loss = self.bce_loss(pred[..., 4:], target[..., 4:]) * target_mask.unsqueeze(-1)  # unsqueeze to match dims
 
-        # Combine the losses, using scaling:
-        total_loss = self.lambda_localization * localization_loss + conf_loss_with_targets + self.lambda_noobj * conf_loss_no_targets + class_loss
+        # Combine the losses using scaling factors, and normalize by the batch size (to get mean across batch):
+        num_boxes = pred.shape[0] * pred.shape[1]
+        total_loss = (
+            confidence_loss +
+            self.lambda_localization * localization_loss_x.sum() +
+            self.lambda_localization * localization_loss_w.sum() +
+            self.lambda_localization * localization_loss_a.sum()+
+            classification_loss.sum()
+        ) / num_boxes
 
         return total_loss
-
 
 def compute_iou(gt_start, gt_end, pred_start, pred_end):
     inter_start = max(gt_start, pred_start)
     inter_end = min(gt_end, pred_end)
     inter = max(0, inter_end - inter_start)
-    union = (gt_end-gt_start)+(pred_end-pred_start)-inter
-    epsilon = 1e-6
-    return inter / (union +epsilon)
+    union = (gt_end - gt_start) + (pred_end - pred_start) - inter
+    iou_result = inter / (union + 1e-6)
+    
+    return iou_result
 
-import numpy as np
-
-def evaluate_segments(model, dataloader, label_encoder, iou_thresh=0.05):
+def evaluate_segments(model, dataloader, label_encoder, iou_thresh=0.5):
     model.eval()
     total_windows = 0
     windows_with_no_gt = 0
@@ -415,27 +462,141 @@ def evaluate_segments(model, dataloader, label_encoder, iou_thresh=0.05):
     print("\n=== Classification Report for Segments ===")
     print(classification_report(all_true_classes, all_pred_classes, target_names=label_encoder.classes_, zero_division=0))
 
+def reconstruct_gt_segments_from_tensor(target_tensor, le, window_size, anchors):
+    """Reconstructs ground truth segments from the target tensor without applying transformations."""
+    num_detectors, num_anchors, _ = target_tensor.shape
+    cell_width = window_size / num_detectors
+    gt_segments = []
 
+    # Find where confidence (p_c) is 1
+    responsible_anchors = torch.where(target_tensor[..., 0] == 1)
+    
+    for i, j in zip(*responsible_anchors):
+        i, j = i.item(), j.item() # cell index, anchor index
+        
+        data = target_tensor[i, j]
+        t_x = data[1].item()
+        t_w = data[2].item()
+        
+        # Decode coordinates from ground truth values
+        midpoint = (i + t_x) * cell_width
+        # Reverse the log-space transformation for width
+        duration = torch.exp(torch.tensor(t_w)) * anchors[j].item() * cell_width
+        
+        start = max(0, int(midpoint - duration / 2))
+        end = min(window_size - 1, int(midpoint + duration / 2))
+        
+        class_id = torch.argmax(data[4:]).item()
+        class_label = le.inverse_transform([class_id])[0]
+        
+        gt_segments.append((start, end, 1.0, class_id, class_label))
+        
+    return gt_segments
 
-def train(model, dataloader, optimizer, criterion, epochs=10, num_classes=5):
+def train(model, dataloader, optimizer, criterion, epochs=10):
     print("Starting training...")
 
-    model.train()
     for epoch in range(epochs):
-        total_loss = 0
+        train_loss = 0
+        model.train()
         for x_batch, y_batch in dataloader:
             x_batch = x_batch.to(device)
             y_batch = y_batch.to(device)
 
             optimizer.zero_grad()
-            logits, preds = model(x_batch)
+            preds = model(x_batch)
             loss = criterion(preds, y_batch)
             loss.backward()
             optimizer.step()
-            total_loss += loss.item()
-        print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss:.4f}")
+            train_loss += loss.item()
+        print(f"Training: Epoch {epoch+1}/{epochs}, Loss: {train_loss:.4f}")
+def evaluate_segments_by_iou(pred_segments, target_segments, min_iou: float = 0.5):
+    """
+    Compare the predicted segments to the target (ground truth) segments using IoU.
 
-def evaluate_plot(model, dataset, window_size, stride, le):
+    Will iterate through the segments, and try to find a predicted segment that matches each ground truth segment by
+    using IoU. This is done by finding the predicted segment with the highest IoU to the target segment and having the
+    same class index.
+
+    :param pred_segments: the predicted segments as a list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
+    :param target_segments: the target segments as a list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
+    :param min_iou: predicted segment must have at least this much IoU with the target to be considered
+    """
+
+    # Store indices of predictions that have been matched ("used"):
+    matched_pred_idxes: list[int] = list()
+
+    # IoUs found for all target segments:
+    max_iou_per_target: list[float] = list()
+
+    # List of whether each target segment was matched:
+    segments_matched: list[bool] = list()
+
+    for target_segment in target_segments:
+        target_start, target_end, _, target_label_index, _ = target_segment
+
+        max_iou: float = -math.inf
+        max_iou_idx: int | None = None
+
+        for pred_idx, pred_segment in enumerate(pred_segments):
+            if pred_idx in matched_pred_idxes:
+                # Don't match a prediction to more than one target
+                continue
+
+            pred_start, pred_end, _, pred_label_index, _ = pred_segment
+
+            if pred_label_index != target_label_index:
+                # Labels don't match, so don't use this segment:
+                continue
+
+            iou_with_target = iou(target_segment, pred_segment)
+
+            if iou_with_target < min_iou:
+                # IoU too low, so skip:
+                continue
+
+            # Check if the segment has the highest IoU so far:
+            if iou_with_target > max_iou:
+                max_iou = iou_with_target
+                max_iou_idx = pred_idx
+
+        if max_iou_idx is not None:
+            # We found a segment with high enough IoU, so use that:
+            max_iou_per_target.append(max_iou)
+            segments_matched.append(True)
+
+            # Mark this predicted segment as matched:
+            matched_pred_idxes.append(max_iou_idx)
+        else:
+            # No segment was found, so the IoU was zero:
+            max_iou_per_target.append(0.0)
+            segments_matched.append(False)
+
+    total_matches = sum(segments_matched)
+    total_target_segments = len(target_segments)
+    total_predicted_segments = len(pred_segments)
+
+    unmatched_targets = total_target_segments - total_matches
+    unmatched_predicted_segments = total_predicted_segments - total_matches
+
+    precision = total_matches / total_predicted_segments if total_predicted_segments > 0 else 0.0
+    recall = total_matches / total_target_segments if total_target_segments > 0 else 0.0
+    f1 = 2 * precision * recall / (precision + recall)
+
+    best_iou = max(max_iou_per_target)
+    mean_iou = sum(max_iou_per_target) / len(max_iou_per_target)
+
+    print("\n=== Segment-Level Evaluation ===")
+    print(f"Total ground-truth segments:   {total_target_segments}")
+    print(f"Total predicted segments:      {total_predicted_segments}")
+    print(f"Matched segments:              {total_matches}\n")
+    print(f"Precision:                     {precision:.3f}")
+    print(f"Recall:                        {recall:.3f}")
+    print(f"F1 Score:                      {f1:.3f}")
+    print(f"Best IoU:                      {best_iou:.3f}")
+    print(f"Mean IoU:                      {mean_iou:.3f}")
+
+def evaluate_plot(model, dataset, dataset_name, window_size, stride, le,anchors, background_label = 'Other'):
     """
     Evaluate the model by running it on all of the input data in the data loader, then construct labels and plot
     them against the ground truth data.
@@ -454,7 +615,10 @@ def evaluate_plot(model, dataset, window_size, stride, le):
     model.eval()
 
     eval_dataloader = DataLoader(dataset, batch_size=32, shuffle=False)
+    num_windows = len(dataset)
+    total_num_events = num_windows * window_size
 
+    background_label_index = le.transform([background_label])[0]
     all_preds = []
     all_targets = []
 
@@ -462,50 +626,74 @@ def evaluate_plot(model, dataset, window_size, stride, le):
         x_batch = x_batch.to(device)
 
         with torch.no_grad():
-            logits, preds = model(x_batch)
+            preds = model(x_batch)
 
-            # Move values back to cpu and split batch out into individual arrays per window:
-            preds_by_window = list(preds.to('cpu').numpy())
-            targets_by_window = list(y_batch.numpy())
-
-            all_preds.extend(preds_by_window)
-            all_targets.extend(targets_by_window)
-
+            all_preds.append(preds.to('cpu'))
+            all_targets.append(y_batch)
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
     pred_segments = []
 
     for window_index, window_detections in enumerate(all_preds):
-        segments_for_window = construct_segments_from_detections(window_detections, le, window_size, 0.05, 0.0)
+        segments_for_window = construct_segments_from_detections(window_detections, le, window_size, anchors.cpu(), 0.5, 0.0)
 
         # Convert the segment indices to overall indices using the window_index:
         for segment in segments_for_window:
-            seg_start_in_window, seg_end_in_window, p_c, label = segment
+            seg_start_in_window, seg_end_in_window, p_c, label_index, label = segment
             seg_start_in_sequence = window_index * window_size + seg_start_in_window
             seg_end_in_sequence = window_index * window_size + seg_end_in_window
 
-            pred_segments.append((seg_start_in_sequence, seg_end_in_sequence, p_c, label))
+            pred_segments.append((seg_start_in_sequence, seg_end_in_sequence, p_c, label_index, label))
 
     actual_segments = []
 
     for window_index, window_detections in enumerate(all_targets):
-        segments_for_window = construct_segments_from_detections(window_detections, le, window_size, 0.05, 0.0)
+        segments_for_window = reconstruct_gt_segments_from_tensor(window_detections, le, window_size, anchors.cpu())
 
         # Convert the segment indices to overall indices using the window_index:
         for segment in segments_for_window:
-            seg_start_in_window, seg_end_in_window, p_c, label = segment
+            seg_start_in_window, seg_end_in_window, p_c, label_index, label = segment
             seg_start_in_sequence = window_index * window_size + seg_start_in_window
             seg_end_in_sequence = window_index * window_size + seg_end_in_window
 
-            actual_segments.append((seg_start_in_sequence, seg_end_in_sequence, p_c, label))
+            actual_segments.append((seg_start_in_sequence, seg_end_in_sequence, p_c, label_index, label))
 
-    num_windows = len(all_targets)
-    num_detectors = all_targets[0].shape[0]
-    plot_segments(actual_segments, pred_segments, num_windows, window_size, num_detectors, le)
+    # Find individual event labels from the segments and calculate accuracy:
+    pred_labels = segments_to_event_labels(pred_segments, total_num_events, background_label_index)
+    actual_labels = segments_to_event_labels(actual_segments, total_num_events, background_label_index)
 
-def plot_segments(actual_segments, pred_segments, num_windows, window_size, num_detectors, le):
+    print(classification_report(
+        actual_labels,
+        pred_labels,
+        labels=range(len(le.classes_)),
+        target_names=le.classes_
+    ))
+
+    # Compare the segments by trying to find highest-IoU matching for each target segment:
+    evaluate_segments_by_iou(pred_segments, actual_segments)
+
+    plot_segments(actual_segments, pred_segments, num_windows, window_size, le, dataset_name)
+def segments_to_event_labels(segments: list[tuple[int, int, float, int, str]], total_num_events: int, background_label_index: int) -> np.ndarray:
+    """
+    Converts a list of segments into per-event labels (i.e. one label per each input sensor instance).
+    The input should be a list of segments, each a tuple of (start_index, end_index, p_c, label_integer, label_str).
+    Returns a 1D array of integers, where the value at each index is the integer corresponding to the label for that
+    event. (With the background_label_index applying where there is no label)
+    """
+
+    labels = np.full(total_num_events, background_label_index, dtype=int)
+
+    for segment in segments:
+        start_index, end_index, p_c, label_integer, label_str = segment
+
+        labels[start_index:end_index+1] = label_integer
+
+    return labels
+
+def plot_segments(actual_segments, pred_segments, num_windows, window_size, le, dataset_mame):
     """Plot the actual vs predicted segments."""
 
     total_length = num_windows * window_size
-    detector_size = window_size // num_detectors
 
     classes = list(le.classes_)
 
@@ -515,28 +703,29 @@ def plot_segments(actual_segments, pred_segments, num_windows, window_size, num_
 
     # Plot the actual segments:
     for segment in actual_segments:
-        seg_start, seg_end, p_c, label = segment
-        label_index = classes.index(label)
+        seg_start, seg_end, p_c, label_index, label = segment
 
         ax.barh(0, left=seg_start, width=seg_end-seg_start, height=0.5, color=cmap(label_index))
 
     # Plot the predicted segments:
     for segment in pred_segments:
-        seg_start, seg_end, p_c, label = segment
-        label_index = classes.index(label)
+        seg_start, seg_end, p_c, label_index, label = segment
 
         ax.barh(-0.5, left=seg_start, width=seg_end-seg_start, height=0.5, color=cmap(label_index))
 
+    # # Plot window dividers:
+    # for i in range(total_length // window_size):
+    #     ax.axvline(i * window_size, color='k')
+
     # Drop a separation:
     ax.axhline(-0.25, color='black')
-
 
     # Set axis limits:
     ax.set_xlim(0, total_length)
     ax.set_ylim(-0.75, 0.25)
     ax.set_yticks([])
     ax.set_xlabel('Frames Since Start')
-    ax.set_title('Activity Segments')
+    ax.set_title(f'{dataset_mame} Activity Segments')
 
     # Create legend:
     legend_patches = [mpatches.Patch(color=cmap(label_index), label=label) for label_index, label in enumerate(sorted(classes))]
@@ -546,18 +735,21 @@ def plot_segments(actual_segments, pred_segments, num_windows, window_size, num_
     plt.tight_layout()
     plt.show()
 
-from collections import deque
-import numpy as np
-
-def construct_segments_from_detections(detections, le, window_size, min_p_c, allowed_iou):
+def construct_segments_from_detections(detections, le, window_size,anchors, conf_threshold=0.5, nms_iou_threshold=0.5):
     """
-    Reconstruct label segments in a window based on the detection box predictions (or ground truths), along with the
+    Reconstruct label segments in a window based on the detection cell predictions (or ground truths), along with the
     window size.
 
+    Will apply functions to the raw detection values to convert them into the event space (i.e. convert t_w from
+    log-space into event space, etc)
+
+    Returns a list of segment tuples of (start_index, end_index, p_c, label_index, label_str).
+
     :param detections: list of detections for the window as a #detectors x (3 + #classes) array (each row is a detector
-        output of [p_c, b_x, b_w, c_1, ..., c_N]
+        output of [p_c, t_x, t_w, c_1, ..., c_N]. These should not be scaled at all yet - that is done in this function
     :param le: label encoder (to get the label names)
     :param window_size: the number of frames in the window
+    :param anchors: scaled durations of activities
     :param min_p_c: minimum p_c value to keep a detection (ignores detections with lower p_c)
     :param allowed_iou: for non-max-suppression, keep detections where the iou between the detections is this value or
         less. To disallow any overlap, use 0.0. If two detections overlap, the higher-p_c of the two is used for the
@@ -565,56 +757,57 @@ def construct_segments_from_detections(detections, le, window_size, min_p_c, all
     """
 
     # Convert detections into proposed segments based on window and detector sizes:
-    num_detectors = detections.shape[0]
-    detection_width = window_size // num_detectors
-
+    num_detectors, num_anchors, _ = detections.shape
+    cell_width = window_size / num_detectors
+    
     proposed_segments = []
 
-    for detector_index, detection in enumerate(detections):
-        p_c = detection[0]  # confidence
-        b_x = detection[1]  # center of detected segment (relative to detection box)
-        b_w = detection[2]  # width of detected segment (relative to detection box)
-        p_classes = detection[3:]  # probability of classes (note: includes Other)
+    for i in range(num_detectors):
+        for j in range(num_anchors):
+            detection = detections[i, j, :]
+            
+            p_c = torch.sigmoid(detection[0]).item()
+            if p_c < conf_threshold:
+                continue
+            
+            # Decode coordinates
+            b_x = torch.sigmoid(detection[1]).item()
+            b_w = torch.exp(detection[2]).item() * anchors[j].item()
+            
+            midpoint = (i + b_x) * cell_width
+            duration = b_w * cell_width
+            
+            start = max(0, int(midpoint - duration / 2))
+            end = min(window_size - 1, int(midpoint + duration / 2))
+            
+            class_probs = torch.sigmoid(detection[4:])
+            class_id = torch.argmax(class_probs).item()
+            class_label = le.inverse_transform([class_id])[0]
+            
+            proposed_segments.append((start, end, p_c, class_id, class_label))
 
-        if p_c < min_p_c:
-            # Not high enough confidence, skip
-            continue
-
-        # Calculate the start/end indices (relative to the window) of the detected segment:
-        detector_start = detector_index * detection_width
-
-        segment_midpoint = detector_start + detection_width * b_x  # midpoint using relative size to detector
-        segment_length = detection_width * b_w  # segment length relative to detector size
-
-        segment_start = max(int(segment_midpoint - segment_length / 2), 0)
-        segment_end = min(int(segment_midpoint + segment_length / 2), window_size - 1)
-
-        proposed_segments.append((segment_start, segment_end, p_c, p_classes))
-    
-    # Perform non-max-suppression on the proposed segments:
-    # Sort the segments from highest to lowest p_c:
-    remaining_proposed = deque(sorted(proposed_segments, key=lambda segment: segment[2], reverse=True))
-
+    # Perform Non-Maximum Suppression (NMS)
+    proposed_segments.sort(key=lambda x: x[2], reverse=True)
     final_segments = []
 
-    while remaining_proposed:
-        # Get the remaining segment with highest confidence, and add it to final segments:
-        highest_confidence_segment = remaining_proposed.popleft()
-        seg_start, seg_end, p_c, p_classes = highest_confidence_segment
-        class_idx = int(np.argmax(p_classes))
-        segment_class_name = le.inverse_transform([class_idx])[0]
-
-        final_segments.append((seg_start, seg_end, p_c, segment_class_name))
-
-        # Filter out overlapping ones (IOU > allowed_iou)
-        filtered = []
-        for (s_start, s_end, sc, cl_probs) in remaining_proposed:
-            if iou((seg_start, seg_end), (s_start, s_end)) <= allowed_iou:
-                filtered.append((s_start, s_end, sc, cl_probs))
-
-        remaining_proposed = deque(filtered)
-
+    while proposed_segments:
+        current_segment = proposed_segments.pop(0)
+        final_segments.append(current_segment)
+        
+        # Filter out overlapping segments of the same class
+        remaining_segments = []
+        for seg in proposed_segments:
+            if seg[3] != current_segment[3]: # Keep if different class
+                remaining_segments.append(seg)
+                continue
+            
+            iou_val = iou(current_segment[:2], seg[:2])
+            if iou_val < nms_iou_threshold:
+                remaining_segments.append(seg)
+        proposed_segments = remaining_segments
+        
     return final_segments
+
 
 
 def iou(segment1, segment2):
@@ -636,8 +829,8 @@ def iou(segment1, segment2):
 
 
 if __name__ == "__main__":
-    csv_files = glob.glob("*.chest.csv")#adjust this if you have different path
-    X, Y, label_encoder = load_and_window_data(csv_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS)
+    csv_files = glob.glob("*.hand.csv")#adjust this if you have different path
+    X, Y, label_encoder = load_and_window_data(csv_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS, anchors=ANCHOR_BOXES)
 
     dataset = YodaSensorDataset(X, Y)
     train_size = int(0.8 * len(dataset))
@@ -648,15 +841,14 @@ if __name__ == "__main__":
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
     num_classes = len(label_encoder.classes_)
-    model = Yoda(input_channels=X.shape[2], num_classes=num_classes, num_detectors=NUM_DETECTORS)
+    model = Yoda(input_channels=X.shape[2], num_classes=num_classes, num_detectors=NUM_DETECTORS, num_anchors=NUM_ANCHORS)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
     # Move model and optimizer to GPU:
     model.to(device)
 
-    train(model, train_loader, optimizer, YODALoss(), epochs=EPOCHS,num_classes=num_classes)
+    train(model, train_loader, optimizer, YODALoss(), epochs=EPOCHS)
     print("evaluate training set")
-    evaluate_segments(model, train_loader, label_encoder, iou_thresh=0.05)
+    evaluate_plot(model, train_dataset, 'Training', window_size=8192, stride=8192, le=label_encoder,anchors=ANCHOR_BOXES)
     print("evaluate testing set")
-    evaluate_segments(model, test_loader, label_encoder, iou_thresh=0.05)
-    evaluate_plot(model, dataset, window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder)
+    evaluate_plot(model, test_dataset, 'Testing', window_size=8192, stride=8192, le=label_encoder,anchors=ANCHOR_BOXES)
