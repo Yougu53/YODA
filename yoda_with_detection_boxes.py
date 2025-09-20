@@ -23,7 +23,7 @@ EXCLUDE_FEATURES = [
 
 LABEL_COLUMN = "user_activity_label"
 BATCH_SIZE = 32
-EPOCHS = 20
+EPOCHS = 50
 MODEL_PATH = "yoda_model.pt"
 ENCODER_PATH = "label_encoder.pkl"
 NUM_DETECTORS = 10
@@ -31,7 +31,7 @@ WINDOW_SIZE = 8192
 STRIDE = 8192
 ANCHOR_BOXES = torch.tensor([[0.5], [1.0], [2.0]]).to(device)
 NUM_ANCHORS = len(ANCHOR_BOXES)
-
+TARGET = 'Sitting'
 # Define similar activities for the new evaluation metric
 SIMILAR_ACTIVITIES = {
     'Walking': ['NordicWalking', 'Running'],
@@ -46,7 +46,6 @@ SIMILAR_ACTIVITIES = {
 
 def load_and_window_data(csv_files, window_size, stride, num_detectors, anchors):
     
-    # TODO: Include time information?
     all_X, all_Y, all_labels = [], [], []
 
     for csv_path in csv_files:
@@ -79,11 +78,7 @@ def load_and_window_data(csv_files, window_size, stride, num_detectors, anchors)
     for i in range(0, len(X_all) - window_size+1, stride):
         x_win = X_all[i:i+window_size]
         y_win = Y_all[i:i+window_size]
-
-        # Convert labels into activity segments:
         segments_for_window = frame_labels_to_segments(y_win, label_encoder)
-
-        # Put segments in detection boxes and get the detections array:
         detections_for_window = segments_to_detections(segments_for_window, label_encoder, window_size, num_detectors, anchors)
 
         X_windows.append(x_win)
@@ -91,7 +86,6 @@ def load_and_window_data(csv_files, window_size, stride, num_detectors, anchors)
     print(f"Generated {len(X_windows)} windows.")
     return np.array(X_windows), np.array(Y_windows), label_encoder
 
-# TODO: Replace doing segments and then doing detections with just detections (combine this and next func)?
 
 def frame_labels_to_segments(y_window, le):
     """
@@ -169,13 +163,11 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
     if background_label is not None and background_label in le.classes_:
         background_label_index = le.transform([background_label])[0]
 
-    # Now assign each segment to a detection cell:
     for start, duration, class_id in segments_for_window:
         if class_id == background_label_index:
             # Ignore this segment, as it's background label
             continue
 
-        # Determine the midpoint of the segment:
         midpoint = start + duration // 2
 
         # Find the detection cell the midpoint is in:
@@ -184,18 +176,16 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
             cell_end = cell_start + cell_width
 
             if cell_start <= midpoint < cell_end:
-                # Segment midpoint belongs to the ith cell:
-                # Determine the best anchor for this segment
                 segment_width_ratio = duration / cell_width
                 intersection = torch.min(torch.tensor(segment_width_ratio), anchors.squeeze())
                 union = torch.tensor(segment_width_ratio) + anchors.squeeze() - intersection
                 ious = intersection / (union + 1e-6)
                 best_anchor_idx = torch.argmax(ious).item()
-                p_c = 1.0  # confidence
+                p_c = 1.0
+                
                 t_x = (midpoint - cell_start) / cell_width
                 t_w = np.log(duration / (anchors[best_anchor_idx].item() * cell_width) + 1e-16)
 
-                # Create the class section, with the class id marked as 1:
                 c = [0] * num_classes
                 c[class_id] = 1
                 # Check if an anchor in this cell is already assigned
@@ -246,10 +236,9 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
                     current_y.append(label)
                     current_X.append(X[i])
                 elif is_similar_activity or is_other_same_activity:
-                    # Drop the segment by skipping this frame
                     continue
                 else:
-                    # Re-label as nonA for other un-similar activities
+                    # Re-label as nonA
                     current_y.append(nonA)
                     current_X.append(X[i])
 
@@ -283,6 +272,72 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
     else:
         return None, None, None
 
+def load_and_window_segment(train_files, target_activity, window_size,stride,  nonA):
+    """
+    Loads and windows data for a single segment of a target activity.
+    Other segments of the same activity and similar activities are removed.
+    All other dissimilar activities are re-labeled as nonA.
+    """
+    all_X, all_Y = [], []
+    
+
+    for csv_path in train_files:
+        df = pd.read_csv(csv_path, skiprows=[1])
+        df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns], inplace=True, errors="ignore")
+        df.dropna(inplace=True)
+        
+        if LABEL_COLUMN in df.columns:
+            y = df[LABEL_COLUMN].values
+            X = df.drop(columns=[LABEL_COLUMN]).values.astype(np.float32)
+
+            current_y = []
+            current_X = []
+            for i in range(len(y)):
+                label = y[i]
+                
+                is_target_segment = (label == target_activity )
+                
+                if is_target_segment:
+                    current_y.append(label)
+                    current_X.append(X[i])
+                else:
+                    # Re-label as nonA
+                    current_y.append(nonA)
+                    current_X.append(X[i])
+
+            if len(current_y) > 0:
+                y_filtered = np.array(current_y)
+                X_filtered = np.array(current_X)
+                
+
+                if len(X_filtered) > 0:
+                    all_X.extend(X_filtered)
+                    all_Y.extend(y_filtered)
+    
+    X_all = np.vstack(all_X)
+    Y_all = np.hstack(all_Y)
+    X_mean = np.mean(X_all, axis=0)
+    X_std = np.std(X_all, axis=0) + 1e-6
+    X_all = (X_all - X_mean) / X_std
+    
+    print("Total frames:", len(X_all))
+    print("Unique labels:", np.unique(Y_all))
+    label_encoder = LabelEncoder()
+    label_encoder.fit(Y_all)
+    
+    X_windows = []
+    Y_windows = []
+
+    for i in range(0, len(X_all) - window_size+1, stride):
+        x_win = X_all[i:i+window_size]
+        y_win = Y_all[i:i+window_size]
+        segments_for_window = frame_labels_to_segments(y_win, label_encoder)
+        detections_for_window = segments_to_detections(segments_for_window, label_encoder, window_size, NUM_DETECTORS, ANCHOR_BOXES)
+
+        X_windows.append(x_win)
+        Y_windows.append(detections_for_window)
+    print(f"Generated {len(X_windows)} windows.")
+    return np.array(X_windows), np.array(Y_windows), label_encoder
 
 
 def find_all_segments(csv_files):
@@ -359,13 +414,6 @@ class Yoda(nn.Module):
         x = self.fc(x)
         logits = x.view(-1, self.num_detectors, self.num_anchors, self.num_outputs_per_anchor)
 
-        """ p_c = torch.clamp(logits[..., 0], 0, 1)  # limit confidence to [0, 1], encourage a higher congidence score, not using sigmoid
-        b_x = torch.sigmoid(logits[..., 1])  # box location in [0, 1]
-        b_w = torch.exp(torch.clamp(logits[..., 2], min=-5, max=5))  # box width allowed to be exponential
-        class_probs = torch.softmax(logits[..., 3:], dim=-1)  # softmax the class probabilities to sum to 1 Assume that an object belongs to one class use sigmoid in v3
-
-        detections = torch.cat((p_c.unsqueeze(-1), b_x.unsqueeze(-1), b_w.unsqueeze(-1), class_probs), dim=-1) """
-
         return logits
 
 
@@ -410,7 +458,7 @@ class YODALoss(nn.Module):
         # ground_truth p_c (which is either 1 or 0):
         conf_loss_with_segment = self.bce_loss(pred[..., 0], target[..., 0]) * target_mask  # mult by target mask to only include ones with segment targets
         conf_loss_without_segment = self.bce_loss(pred[..., 0], target[..., 0]) * ~target_mask
-        confidence_loss = conf_loss_with_segment.sum() + self.lambda_noseg * conf_loss_without_segment.sum()
+        confidence_loss = (conf_loss_with_segment.sum() * self.lambda_localization) + (self.lambda_noseg * conf_loss_without_segment.sum())
         # Localization loss:
         # Compute the loss separately for the segment center (t_x) values and the log-space segment width (t_w) values
         # Only include the cells where there is a target
@@ -446,92 +494,6 @@ def compute_iou(gt_start, gt_end, pred_start, pred_end):
     
     return iou_result
 
-def evaluate_segments(model, dataloader, label_encoder, iou_thresh=0.5):
-    model.eval()
-    total_windows = 0
-    windows_with_no_gt = 0
-    windows_with_no_pred = 0
-
-    total_gt = 0
-    total_pred = 0
-    matched = 0
-    all_ious = []
-    
-    # Store true and predicted class labels for a final report
-    all_true_classes = []
-    all_pred_classes = []
-
-    for x_batch, y_batch in dataloader:
-        x_batch = x_batch.to(device)
-        with torch.no_grad():
-            preds = model(x_batch)
-
-        batch_size = preds.shape[0]
-        total_windows += batch_size
-        
-        for i in range(batch_size):
-            true_segs_tensor = y_batch[i]
-            pred_segs_tensor = preds[i]
-            
-            true_list = reconstruct_gt_segments_from_tensor(true_segs_tensor, label_encoder, WINDOW_SIZE, ANCHOR_BOXES.cpu())
-            pred_list = construct_segments_from_detections(pred_segs_tensor, label_encoder, WINDOW_SIZE, ANCHOR_BOXES.cpu(), conf_threshold=0.5, nms_iou_threshold=0.5)
-
-            if not true_list:
-                windows_with_no_gt += 1
-            if not pred_list:
-                windows_with_no_pred += 1
-
-            total_gt += len(true_list)
-            total_pred += len(pred_list)
-
-            ious = []
-            matched_gt = set()
-
-            for pj, pred_seg in enumerate(pred_list):
-                for gj, gt_seg in enumerate(true_list):
-                    if gj in matched_gt:
-                        continue
-                    
-                    iou = compute_iou(gt_seg[0], gt_seg[1], pred_seg[0], pred_seg[1])
-                    ious.append(float(iou))
-                    
-                    if iou >= iou_thresh and pred_seg[3] == gt_seg[3]:
-                        matched += 1
-                        matched_gt.add(gj)
-                        all_true_classes.append(gt_seg[3])
-                        all_pred_classes.append(pred_seg[3])
-                        break
-            
-            # Add all unmatched ground truths and predictions to the list
-            for gt_idx, gt_seg in enumerate(true_list):
-                if gt_idx not in matched_gt:
-                    all_true_classes.append(gt_seg[3])
-                    all_pred_classes.append(label_encoder.transform(['Other'])[0])
-
-            all_ious.extend(ious)
-
-    precision = matched / total_pred if total_pred > 0 else 0.0
-    recall = matched / total_gt if total_gt > 0 else 0.0
-    f1 = 2 * precision * recall / (precision + recall + 1e-8)
-
-    best_iou = max(all_ious) if all_ious else 0.0
-    mean_iou = np.mean(all_ious) if all_ious else 0.0
-
-    print("\n=== Segment-Level Evaluation ===")
-    print(f"Total windows evaluated: {total_windows}")
-    print(f"Windows with no ground-truth segments:   {windows_with_no_gt}")
-    print(f"Windows with no predictions:   {windows_with_no_pred}")
-    print(f"Total ground-truth segments:   {total_gt}")
-    print(f"Total predicted segments:      {total_pred}")
-    print(f"Matched segments:              {matched}\n")
-    print(f"Precision:                     {precision:.3f}")
-    print(f"Recall:                        {recall:.3f}")
-    print(f"F1 Score:                      {f1:.3f}")
-    print(f"Best IoU:                      {best_iou:.3f}")
-    print(f"Mean IoU:                      {mean_iou:.3f}")
-    
-    print("\n=== Classification Report for Segments ===")
-    print(classification_report(all_true_classes, all_pred_classes, target_names=label_encoder.classes_, zero_division=0))
 
 def reconstruct_gt_segments_from_tensor(target_tensor, le, window_size, anchors):
     """Reconstructs ground truth segments from the target tensor without applying transformations."""
@@ -554,8 +516,8 @@ def reconstruct_gt_segments_from_tensor(target_tensor, le, window_size, anchors)
         # Reverse the log-space transformation for width
         duration = torch.exp(torch.tensor(t_w)) * anchors[j].item() * cell_width
         
-        start = max(0, int(midpoint - duration / 2))
-        end = min(window_size - 1, int(midpoint + duration / 2))
+        start = max(0, int((midpoint - duration )/ 2))
+        end = min(window_size - 1, int((midpoint + duration) / 2))
         
         class_id = torch.argmax(data[4:]).item()
         class_label = le.inverse_transform([class_id])[0]
@@ -581,7 +543,7 @@ def train(model, dataloader, optimizer, criterion, epochs=10):
             optimizer.step()
             train_loss += loss.item()
         print(f"Training: Epoch {epoch+1}/{epochs}, Loss: {train_loss:.4f}")
-def evaluate_segments_by_iou(pred_segments, target_segments, min_iou: float = 0.5):
+def evaluate_segments_by_iou(pred_segments, target_segments, background_label_index,min_iou: float = 0.5):
     """
     Compare the predicted segments to the target (ground truth) segments using IoU.
 
@@ -605,7 +567,9 @@ def evaluate_segments_by_iou(pred_segments, target_segments, min_iou: float = 0.
 
     for target_segment in target_segments:
         target_start, target_end, _, target_label_index, _ = target_segment
-
+        if target_label_index == background_label_index:
+            # Not the target
+            continue
         max_iou: float = -math.inf
         max_iou_idx: int | None = None
 
@@ -617,7 +581,7 @@ def evaluate_segments_by_iou(pred_segments, target_segments, min_iou: float = 0.
             pred_start, pred_end, _, pred_label_index, _ = pred_segment
 
             if pred_label_index != target_label_index:
-                # Labels don't match, so don't use this segment:
+                # Labels don't match with target, so don't use this segment:
                 continue
 
             iou_with_target = iou(target_segment, pred_segment)
@@ -703,7 +667,7 @@ def evaluate_plot(model, dataset, dataset_name, window_size, stride, le,anchors,
     pred_segments = []
 
     for window_index, window_detections in enumerate(all_preds):
-        segments_for_window = construct_segments_from_detections(window_detections, le, window_size, anchors.cpu(), 0.5, 0.0)
+        segments_for_window = construct_segments_from_detections(window_detections, le, window_size, anchors.cpu(), 0.5, 0.5)
 
         # Convert the segment indices to overall indices using the window_index:
         for segment in segments_for_window:
@@ -739,7 +703,7 @@ def evaluate_plot(model, dataset, dataset_name, window_size, stride, le,anchors,
     ))
 
     # Compare the segments by trying to find highest-IoU matching for each target segment:
-    evaluate_segments_by_iou(pred_segments, actual_segments)
+    evaluate_segments_by_iou(pred_segments, actual_segments,background_label_index)
 
     plot_segments(actual_segments, pred_segments, num_windows, window_size, le, dataset_name)
 def segments_to_event_labels(segments: list[tuple[int, int, float, int, str]], total_num_events: int, background_label_index: int) -> np.ndarray:
@@ -941,22 +905,23 @@ def iou(segment1, segment2):
 
 if __name__ == "__main__":
     train_files = [
-        'subject101.hand.csv',
-        'subject102.hand.csv',
-        'subject103.hand.csv',
-        'subject104.hand.csv',
-        'subject105.hand.csv',
-        'subject106.hand.csv',
-        'subject107.hand.csv'
+        'subject101.chest.csv',
+        'subject102.chest.csv',
+        'subject103.chest.csv',
+        'subject104.chest.csv',
+        'subject105.chest.csv',
+        'subject106.chest.csv'
     ]
-    train_X, train_Y, label_encoder = load_and_window_data(train_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS,anchors=ANCHOR_BOXES)
-
+    test_files = [
+        'subject107.chest.csv',
+        'subject108.chest.csv',
+        'subject109.chest.csv'
+    ]
+    #train_X, train_Y, label_encoder = load_and_window_data(train_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS,anchors=ANCHOR_BOXES)
+    train_X, train_Y, label_encoder = load_and_window_segment(train_files,TARGET,WINDOW_SIZE,STRIDE,'Other')
     train_dataset = YodaSensorDataset(train_X, train_Y)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    test_files = [
-        'subject108.hand.csv',
-        'subject109.hand.csv'
-    ]
+    
     #test_X, test_Y, _ = load_and_window_data(test_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS, existing_label_encoder=label_encoder)
     #test_dataset = YodaSensorDataset(test_X, test_Y)
     num_classes = len(label_encoder.classes_)
@@ -967,9 +932,9 @@ if __name__ == "__main__":
     model.to(device)
 
     train(model, train_loader, optimizer, YODALoss(), epochs=EPOCHS)
-    print("evaluate training set")
-    #evaluate_plot(model, train_dataset, 'Training', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
-    print("evaluate testing set")
+    #print("evaluate training set")
+    evaluate_plot(model, train_dataset, 'Training', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
+    #print("evaluate testing set")
     #evaluate_plot(model, test_dataset, 'Testing', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
 
     all_test_segments = find_all_segments(test_files)
@@ -978,12 +943,12 @@ if __name__ == "__main__":
     print("\n--- Evaluating each segment in the test set ---")
     
     for activity, start, duration in all_test_segments:
-        # Ignore "Other" activities and similar activities
-        if activity == 'Other':
+        # Ignore "Other" activities
+        if activity != TARGET:
             continue
             
         similar_activities = SIMILAR_ACTIVITIES.get(activity, [])
-        non_A = 'Ironing' if activity != 'Ironing' else 'RopeJumping'
+        non_A = 'Other'
             
         # Create a temporary, isolated dataset for this segment
         temp_X, temp_Y, temp_le = load_and_window_single_segment(
