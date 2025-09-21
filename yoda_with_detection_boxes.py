@@ -9,7 +9,7 @@ from matplotlib import pyplot as plt
 import matplotlib.patches as mpatches
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import classification_report
+from sklearn.metrics import classification_report,accuracy_score
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -23,15 +23,15 @@ EXCLUDE_FEATURES = [
 
 LABEL_COLUMN = "user_activity_label"
 BATCH_SIZE = 32
-EPOCHS = 50
+EPOCHS = 20
 MODEL_PATH = "yoda_model.pt"
 ENCODER_PATH = "label_encoder.pkl"
 NUM_DETECTORS = 10
-WINDOW_SIZE = 8192
-STRIDE = 8192
+WINDOW_SIZE = 16384
+STRIDE = 16384
 ANCHOR_BOXES = torch.tensor([[0.5], [1.0], [2.0]]).to(device)
 NUM_ANCHORS = len(ANCHOR_BOXES)
-TARGET = 'Sitting'
+TARGET = 'Walking'
 # Define similar activities for the new evaluation metric
 SIMILAR_ACTIVITIES = {
     'Walking': ['NordicWalking', 'Running'],
@@ -209,9 +209,9 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
     All other dissimilar activities are re-labeled as nonA.
     """
     all_X, all_Y = [], []
+    window_size = WINDOW_SIZE
+    offset = 0  # keep track of global frame index
     
-    window_size = target_duration
-
     for csv_path in csv_files:
         df = pd.read_csv(csv_path, skiprows=[1])
         df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns], inplace=True, errors="ignore")
@@ -224,12 +224,16 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
             current_y = []
             current_X = []
             for i in range(len(y)):
+                global_i = i + offset  # global frame index
                 label = y[i]
                 
-                is_target_segment = (label == target_activity and i >= target_start_frame and i < target_start_frame + target_duration)
+                is_target_segment = (
+                    label == target_activity
+                    and global_i >= target_start_frame
+                    and global_i < target_start_frame + target_duration
+                )
                 
                 is_similar_activity = (label in similar)
-                
                 is_other_same_activity = (label == target_activity and not is_target_segment)
 
                 if is_target_segment:
@@ -253,7 +257,9 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
                     y_win = y_filtered[i:i+window_size]
                     
                     segments_for_window = frame_labels_to_segments(y_win, le)
-                    detections_for_window = segments_to_detections(segments_for_window, le, window_size, NUM_DETECTORS, ANCHOR_BOXES)
+                    detections_for_window = segments_to_detections(
+                        segments_for_window, le, window_size, NUM_DETECTORS, ANCHOR_BOXES
+                    )
                     
                     X_windows.append(x_win)
                     Y_detections.append(detections_for_window)
@@ -261,6 +267,8 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
                 if len(X_windows) > 0:
                     all_X.extend(X_windows)
                     all_Y.extend(Y_detections)
+
+        offset += len(y)  # update offset for next file
 
     if len(all_X) > 0:
         X_all = np.array(all_X)
@@ -271,6 +279,7 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
         return X_all, Y_all, le
     else:
         return None, None, None
+
 
 def load_and_window_segment(train_files, target_activity, window_size,stride,  nonA):
     """
@@ -332,6 +341,7 @@ def load_and_window_segment(train_files, target_activity, window_size,stride,  n
         x_win = X_all[i:i+window_size]
         y_win = Y_all[i:i+window_size]
         segments_for_window = frame_labels_to_segments(y_win, label_encoder)
+        
         detections_for_window = segments_to_detections(segments_for_window, label_encoder, window_size, NUM_DETECTORS, ANCHOR_BOXES)
 
         X_windows.append(x_win)
@@ -346,6 +356,7 @@ def find_all_segments(csv_files):
     all_segments: (activity_label, start_frame, duration).
     """
     all_segments = []
+    offset = 0  # keeps track of global frame index
     
     for csv_path in csv_files:
         df = pd.read_csv(csv_path, skiprows=[1])
@@ -362,14 +373,19 @@ def find_all_segments(csv_files):
                     if y[i] != current_label:
                         end = i
                         duration = end - start
-                        all_segments.append((current_label, start, duration))
+                        all_segments.append((current_label, start + offset, duration))
                         start = i
                         current_label = y[i]
                 
+                # add last segment
                 end = len(y)
                 duration = end - start
-                all_segments.append((current_label, start, duration))
+                all_segments.append((current_label, start + offset, duration))
+                
+            offset += len(y)  # update offset for next file
+            
     return all_segments
+
 
 
 class YodaSensorDataset(Dataset):
@@ -701,7 +717,7 @@ def evaluate_plot(model, dataset, dataset_name, window_size, stride, le,anchors,
         labels=range(len(le.classes_)),
         target_names=le.classes_
     ))
-
+    print(accuracy_score(actual_labels,pred_labels))
     # Compare the segments by trying to find highest-IoU matching for each target segment:
     evaluate_segments_by_iou(pred_segments, actual_segments,background_label_index)
 
@@ -938,7 +954,6 @@ if __name__ == "__main__":
     #evaluate_plot(model, test_dataset, 'Testing', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
 
     all_test_segments = find_all_segments(test_files)
-    
     # Iterate through each segment and perform evaluation
     print("\n--- Evaluating each segment in the test set ---")
     
