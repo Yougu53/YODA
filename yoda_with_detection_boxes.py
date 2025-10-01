@@ -23,9 +23,7 @@ EXCLUDE_FEATURES = [
 
 LABEL_COLUMN = "user_activity_label"
 BATCH_SIZE = 32
-EPOCHS = 20
-MODEL_PATH = "yoda_model.pt"
-ENCODER_PATH = "label_encoder.pkl"
+EPOCHS = 50
 NUM_DETECTORS = 10
 WINDOW_SIZE = 16384
 STRIDE = 16384
@@ -137,7 +135,6 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
     detection cell.
 
     If background_label is set, that label is considered background, and so its segments are not assigned to detectors.
-    # TODO: Fix the number of classes N to not include "Other" label as one of the slots
 
     (Note: If multiple segments have midpoints in the same cell, only the last of those segments will be included. This
     is something that would be fixed with different bounding boxes in each detector.)
@@ -203,82 +200,64 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
 
 
 def load_and_window_single_segment(csv_files, target_activity, target_start_frame, target_duration, similar, nonA, le):
-    """
-    Loads and windows data for a single segment of a target activity.
-    Other segments of the same activity and similar activities are removed.
-    All other dissimilar activities are re-labeled as nonA.
-    """
     all_X, all_Y = [], []
-    window_size = WINDOW_SIZE
-    offset = 0  # keep track of global frame index
+    offset = 0  # global frame index
     
     for csv_path in csv_files:
         df = pd.read_csv(csv_path, skiprows=[1])
-        df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns], inplace=True, errors="ignore")
+        df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns],
+                inplace=True, errors="ignore")
         df.dropna(inplace=True)
         
         if LABEL_COLUMN in df.columns:
             y = df[LABEL_COLUMN].values
             X = df.drop(columns=[LABEL_COLUMN]).values.astype(np.float32)
 
-            current_y = []
-            current_X = []
             for i in range(len(y)):
-                global_i = i + offset  # global frame index
+                global_i = i + offset
                 label = y[i]
                 
                 is_target_segment = (
                     label == target_activity
-                    and global_i >= target_start_frame
-                    and global_i < target_start_frame + target_duration
+                    and target_start_frame <= global_i < target_start_frame + target_duration
                 )
-                
                 is_similar_activity = (label in similar)
                 is_other_same_activity = (label == target_activity and not is_target_segment)
 
                 if is_target_segment:
-                    current_y.append(label)
-                    current_X.append(X[i])
+                    all_Y.append(label)
+                    all_X.append(X[i])
                 elif is_similar_activity or is_other_same_activity:
                     continue
                 else:
-                    # Re-label as nonA
-                    current_y.append(nonA)
-                    current_X.append(X[i])
+                    all_Y.append(nonA)
+                    all_X.append(X[i])
+        
+        offset += len(y)
 
-            if len(current_y) > 0:
-                y_filtered = np.array(current_y)
-                X_filtered = np.array(current_X)
-                
-                # window the filtered data
-                X_windows, Y_detections = [], []
-                for i in range(0, len(X_filtered) - window_size + 1, window_size):
-                    x_win = X_filtered[i:i+window_size]
-                    y_win = y_filtered[i:i+window_size]
-                    
-                    segments_for_window = frame_labels_to_segments(y_win, le)
-                    detections_for_window = segments_to_detections(
-                        segments_for_window, le, window_size, NUM_DETECTORS, ANCHOR_BOXES
-                    )
-                    
-                    X_windows.append(x_win)
-                    Y_detections.append(detections_for_window)
-
-                if len(X_windows) > 0:
-                    all_X.extend(X_windows)
-                    all_Y.extend(Y_detections)
-
-        offset += len(y)  # update offset for next file
-
-    if len(all_X) > 0:
-        X_all = np.array(all_X)
-        Y_all = np.array(all_Y)
-        X_mean = np.mean(X_all, axis=(0, 1))
-        X_std = np.std(X_all, axis=(0, 1)) + 1e-6
-        X_all = (X_all - X_mean) / X_std
-        return X_all, Y_all, le
-    else:
+    if len(all_Y) == 0:
         return None, None, None
+
+    X_all = np.vstack(all_X)
+    Y_all = np.hstack(all_Y)
+    X_mean = np.mean(X_all, axis=0)
+    X_std = np.std(X_all, axis=0) + 1e-6
+    X_all = (X_all - X_mean) / X_std
+
+    X_windows, Y_windows = [], []
+    for i in range(0, len(X_all) - WINDOW_SIZE + 1, WINDOW_SIZE):
+        x_win = X_all[i:i+WINDOW_SIZE]
+        y_win = Y_all[i:i+WINDOW_SIZE]
+
+        segments_for_window = frame_labels_to_segments(y_win, le)
+        detections_for_window = segments_to_detections(
+            segments_for_window, le, WINDOW_SIZE, NUM_DETECTORS, ANCHOR_BOXES
+        )
+
+        X_windows.append(x_win)
+        Y_windows.append(detections_for_window)
+
+    return np.array(X_windows), np.array(Y_windows), le
 
 
 def load_and_window_segment(train_files, target_activity, window_size,stride,  nonA):
@@ -349,40 +328,37 @@ def load_and_window_segment(train_files, target_activity, window_size,stride,  n
     print(f"Generated {len(X_windows)} windows.")
     return np.array(X_windows), np.array(Y_windows), label_encoder
 
-
 def find_all_segments(csv_files):
     """
     Finds all segments (occurrences) of all activities in the dataset.
     all_segments: (activity_label, start_frame, duration).
     """
-    all_segments = []
-    offset = 0  # keeps track of global frame index
     
+    all_segments = []
+    all_Y = []
     for csv_path in csv_files:
         df = pd.read_csv(csv_path, skiprows=[1])
         df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns], inplace=True, errors="ignore")
         df.dropna(inplace=True)
-        
+
         if LABEL_COLUMN in df.columns:
             y = df[LABEL_COLUMN].values
-            
-            if len(y) > 0:
-                current_label = y[0]
+            all_Y.extend(y)
+    if len(all_Y) > 0:
+                current_label = all_Y[0]
                 start = 0
-                for i in range(1, len(y)):
-                    if y[i] != current_label:
+                for i in range(1, len(all_Y)):
+                    if all_Y[i] != current_label:
                         end = i
                         duration = end - start
-                        all_segments.append((current_label, start + offset, duration))
+                        all_segments.append((current_label, start, duration))
                         start = i
-                        current_label = y[i]
-                
-                # add last segment
-                end = len(y)
+                        current_label = all_Y[i]
+
+                end = len(all_Y)
                 duration = end - start
-                all_segments.append((current_label, start + offset, duration))
-                
-            offset += len(y)  # update offset for next file
+                all_segments.append((current_label, start, duration))
+
             
     return all_segments
 
@@ -475,6 +451,7 @@ class YODALoss(nn.Module):
         conf_loss_with_segment = self.bce_loss(pred[..., 0], target[..., 0]) * target_mask  # mult by target mask to only include ones with segment targets
         conf_loss_without_segment = self.bce_loss(pred[..., 0], target[..., 0]) * ~target_mask
         confidence_loss = (conf_loss_with_segment.sum() * self.lambda_localization) + (self.lambda_noseg * conf_loss_without_segment.sum())
+        #conf_loss_with_segment.sum() + self.lambda_noseg * conf_loss_without_segment.sum()
         # Localization loss:
         # Compute the loss separately for the segment center (t_x) values and the log-space segment width (t_w) values
         # Only include the cells where there is a target
@@ -559,67 +536,59 @@ def train(model, dataloader, optimizer, criterion, epochs=10):
             optimizer.step()
             train_loss += loss.item()
         print(f"Training: Epoch {epoch+1}/{epochs}, Loss: {train_loss:.4f}")
-def evaluate_segments_by_iou(pred_segments, target_segments, background_label_index,min_iou: float = 0.5):
+def evaluate_segments_by_iou(pred_segments, target_segments, background_label_index, min_iou: float = 0.5, onset_tolerance: int = 100):
     """
-    Compare the predicted segments to the target (ground truth) segments using IoU.
+    Compare predicted segments to ground truth using IoU, and also compute detection latency and onset alignment.
 
-    Will iterate through the segments, and try to find a predicted segment that matches each ground truth segment by
-    using IoU. This is done by finding the predicted segment with the highest IoU to the target segment and having the
-    same class index.
-
-    :param pred_segments: the predicted segments as a list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
-    :param target_segments: the target segments as a list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
-    :param min_iou: predicted segment must have at least this much IoU with the target to be considered
+    :param pred_segments: list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
+    :param target_segments: list of (start_in_sequence, end_in_sequence, p_c, label_index, label)
+    :param background_label_index: index used for background class
+    :param min_iou: IoU threshold for match
+    :param onset_tolerance: number of frames allowed for onset alignment
     """
 
-    # Store indices of predictions that have been matched ("used"):
     matched_pred_idxes: list[int] = list()
-
-    # IoUs found for all target segments:
     max_iou_per_target: list[float] = list()
-
-    # List of whether each target segment was matched:
     segments_matched: list[bool] = list()
+    latencies: list[float] = list()
+    onset_correct: list[bool] = list()
 
     for target_segment in target_segments:
-        target_start, target_end, _, target_label_index, _ = target_segment
+        target_start, target_end, target_pc, target_label_index, target_label = target_segment
         if target_label_index == background_label_index:
-            # Not the target
             continue
+
         max_iou: float = -math.inf
         max_iou_idx: int | None = None
 
         for pred_idx, pred_segment in enumerate(pred_segments):
             if pred_idx in matched_pred_idxes:
-                # Don't match a prediction to more than one target
                 continue
 
-            pred_start, pred_end, _, pred_label_index, _ = pred_segment
-
+            pred_start, pred_end, pred_pc, pred_label_index, pred_label = pred_segment
             if pred_label_index != target_label_index:
-                # Labels don't match with target, so don't use this segment:
                 continue
 
             iou_with_target = iou(target_segment, pred_segment)
-
             if iou_with_target < min_iou:
-                # IoU too low, so skip:
                 continue
 
-            # Check if the segment has the highest IoU so far:
             if iou_with_target > max_iou:
                 max_iou = iou_with_target
                 max_iou_idx = pred_idx
 
         if max_iou_idx is not None:
-            # We found a segment with high enough IoU, so use that:
             max_iou_per_target.append(max_iou)
             segments_matched.append(True)
-
-            # Mark this predicted segment as matched:
             matched_pred_idxes.append(max_iou_idx)
+
+            # Compute latency and onset correctness
+            pred_start, pred_end, _, _, _ = pred_segments[max_iou_idx]
+            latency = max(0, pred_start - target_start)
+            latencies.append(latency)
+            onset_correct.append(abs(pred_start - target_start) <= onset_tolerance)
+
         else:
-            # No segment was found, so the IoU was zero:
             max_iou_per_target.append(0.0)
             segments_matched.append(False)
 
@@ -634,15 +603,22 @@ def evaluate_segments_by_iou(pred_segments, target_segments, background_label_in
     best_iou = max(max_iou_per_target) if max_iou_per_target else 0.0
     mean_iou = sum(max_iou_per_target) / len(max_iou_per_target) if max_iou_per_target else 0.0
 
+    mean_latency = sum(latencies) / len(latencies) if latencies else 0.0
+    onset_accuracy = sum(onset_correct) / len(onset_correct) if onset_correct else 0.0
+    mean_latency*=0.02
+    onset_accuracy*=0.02
+    onset_tolerance*=0.02
     print("\n=== Segment-Level Evaluation ===")
     print(f"Total ground-truth segments:   {total_target_segments}")
     print(f"Total predicted segments:      {total_predicted_segments}")
     print(f"Matched segments:              {total_matches}\n")
-    print(f"Precision:                     {precision:.3f}")
-    print(f"Recall:                        {recall:.3f}")
-    print(f"F1 Score:                      {f1:.3f}")
-    print(f"Best IoU:                      {best_iou:.3f}")
-    print(f"Mean IoU:                      {mean_iou:.3f}")
+    print(f"Precision:                     {precision:.2f}")
+    print(f"Recall:                        {recall:.2f}")
+    print(f"F1 Score:                      {f1:.2f}")
+    print(f"Best IoU:                      {best_iou:.2f}")
+    print(f"Mean IoU:                      {mean_iou:.2f}")
+    print(f"Mean Detection Latency:        {mean_latency:.2f} seconds")
+    print(f"Onset Accuracy (±{onset_tolerance}s):    {onset_accuracy:.2f}")
     
 def evaluate_plot(model, dataset, dataset_name, window_size, stride, le,anchors, background_label = 'Other'):
     """
@@ -921,17 +897,17 @@ def iou(segment1, segment2):
 
 if __name__ == "__main__":
     train_files = [
-        'subject101.chest.csv',
-        'subject102.chest.csv',
-        'subject103.chest.csv',
-        'subject104.chest.csv',
-        'subject105.chest.csv',
-        'subject106.chest.csv'
+        'subject101.hand.csv',
+        'subject102.hand.csv',
+        'subject103.hand.csv',
+        'subject104.hand.csv',
+        'subject105.hand.csv',
+        'subject106.hand.csv'
     ]
     test_files = [
-        'subject107.chest.csv',
-        'subject108.chest.csv',
-        'subject109.chest.csv'
+        'subject107.hand.csv',
+        'subject108.hand.csv',
+        'subject109.hand.csv'
     ]
     #train_X, train_Y, label_encoder = load_and_window_data(train_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS,anchors=ANCHOR_BOXES)
     train_X, train_Y, label_encoder = load_and_window_segment(train_files,TARGET,WINDOW_SIZE,STRIDE,'Other')
