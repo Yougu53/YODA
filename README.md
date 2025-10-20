@@ -18,10 +18,8 @@ Evaluate with metrics (acc, IoU, f1, latency, offset, precision, recall)
 
 Aggregated datasets (PAMAP2, UCI-HAR)
 
-TO DO:
-
 Capture24, GSUR datasets, aggregate labeled instances
 
 Compare with baselines
 
-Report per activity, per dataset, global across activities and datasets
+Report per activity, per dataset, global across activities and datasets (TO DO)
