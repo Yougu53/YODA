@@ -378,7 +378,7 @@ class YodaSensorDataset(Dataset):
         return x_tensor, y_tensor
 
 class Yoda(nn.Module):
-    def __init__(self, input_channels, num_classes, num_detectors, num_anchors):
+    def __init__(self, input_channels, num_classes, num_detectors, num_anchors,cpc_pretrained_path):
         super().__init__()
         self.num_anchors = num_anchors
         self.num_classes = num_classes
