@@ -1,5 +1,3 @@
-from collections import deque
-import glob
 import math
 import pandas as pd
 import numpy as np
@@ -14,23 +12,21 @@ import os
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# features to exclude for pamap2:subject101.ankle.csv
 EXCLUDE_FEATURES = [
     "stamp", "heart_rate_motion_context", 
     "course", "speed","respiratory_rate",
     "sleep_stage", "battery_state"
 ]
-
 LABEL_COLUMN = "user_activity_label"
 BATCH_SIZE = 32
 EPOCHS = 50
-NUM_DETECTORS = 20
+NUM_DETECTORS = 10
 WINDOW_SIZE = 8192
 STRIDE = 8192
 ANCHOR_BOXES = torch.tensor([[0.5], [1.0], [2.0]]).to(device)
 NUM_ANCHORS = len(ANCHOR_BOXES)
-TARGET = 'ClimbDownStairs'
-# Define similar activities for the new evaluation metric
+TARGET = 'BrushTeeth'
+
 SIMILAR_ACTIVITIES = {
     'BrushTeeth': ['Shave'],
     'Sit': ['LieDown','Stand'],
@@ -39,6 +35,7 @@ SIMILAR_ACTIVITIES = {
     'ClimbUpStairs': ['ClimbDownStairs'],
     'ClimbDownStairs': ['ClimbUpStairs']
 }
+
 
 
 def frame_labels_to_segments(y_window, le):
@@ -106,7 +103,7 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
 
     num_classes = len(le.classes_)
     num_anchors = len(anchors)
-    detections = np.zeros((num_detectors, num_anchors, 3 + num_classes), dtype=np.float32)
+    detections = np.zeros((num_detectors, num_anchors, 3 + num_classes), dtype=np.float32)  # one row for each detection [num_detectors, num_anchors, 4 + num_classes]
 
     cell_width = window_size // num_detectors  # (round down to nearest integer)
     # TODO: Handle window size not an exact multiple of the number of detectors
@@ -146,7 +143,11 @@ def segments_to_detections(segments_for_window, le, window_size, num_detectors, 
                     detections[i, best_anchor_idx] = [p_c, t_x, t_w] + c
                 
                 
-                break
+                break  # move to next segment
+
+        # TODO: Fix this
+        # # If we get this far, no detection box was found (maybe due to window_size / detection_size not being integer)?
+        # raise RuntimeError(f'No detection box found for segment index {seg_index} of class ID {class_id}')
 
     return detections
 
@@ -156,16 +157,11 @@ def load_and_window_single_segment(csv_files, target_activity, target_start_fram
     offset = 0  # global frame index
     
     for csv_path in csv_files:
-        chunk_size = 100000  # adjust as needed
-        chunks = []
-        for chunk in pd.read_csv(csv_path, skiprows=[1], chunksize=chunk_size, low_memory=False):
-            chunks.append(chunk)
-        df = pd.concat(chunks, ignore_index=True)
+        df = pd.read_csv(csv_path, skiprows=[1],low_memory=False, on_bad_lines='skip')
         df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns],
                 inplace=True, errors="ignore")
         df[LABEL_COLUMN].fillna("Other", inplace=True)
         df.dropna(inplace=True)
-        
         if LABEL_COLUMN in df.columns:
             y = df[LABEL_COLUMN].values
             X = df.drop(columns=[LABEL_COLUMN]).values.astype(np.float32)
@@ -227,15 +223,12 @@ def load_and_window_segment(train_files, target_activity, window_size,stride,  n
     
 
     for csv_path in train_files:
-        chunk_size = 100000  # adjust as needed
-        chunks = []
-        for chunk in pd.read_csv(csv_path, skiprows=[1], chunksize=chunk_size, low_memory=False):
-            chunks.append(chunk)
-        df = pd.concat(chunks, ignore_index=True)
+        df = pd.read_csv(csv_path, skiprows=[1],low_memory=False, on_bad_lines='skip')
+        print(df['user_activity_label'].value_counts(dropna=False))
+        print("Rows with missing label:", df['user_activity_label'].isna().sum())
         df.drop(columns=[col for col in EXCLUDE_FEATURES if col in df.columns], inplace=True, errors="ignore")
         df[LABEL_COLUMN].fillna("Other", inplace=True)
         df.dropna(inplace=True)
-        
         if LABEL_COLUMN in df.columns:
             y = df[LABEL_COLUMN].values
             X = df.drop(columns=[LABEL_COLUMN]).values.astype(np.float32)
@@ -341,33 +334,45 @@ class YodaSensorDataset(Dataset):
         return x_tensor, y_tensor
 
 class Yoda(nn.Module):
-    def __init__(self, input_channels, num_classes, num_detectors, num_anchors):
+    def __init__(self, input_channels, num_classes, num_detectors, num_anchors, cpc_pretrained_path):
         super().__init__()
         self.num_anchors = num_anchors
         self.num_classes = num_classes
         self.num_detectors = num_detectors
-        # The output size for each anchor: 1 (confidence) + 1 (center_x) + 1 (width) + num_classes
-        self.num_outputs_per_anchor = 3 + self.num_classes
-        self.conv1 = nn.Conv1d(input_channels, 32, kernel_size=3, padding=1)
-        self.bn1 = nn.BatchNorm1d(32)
-        self.conv2 = nn.Conv1d(32, 64, kernel_size=3, padding=1)
-        self.bn2 = nn.BatchNorm1d(64)
-        self.conv3 = nn.Conv1d(64, 128, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm1d(128)
-        self.conv4 = nn.Conv1d(128, 256, kernel_size=3, padding=1)
-        self.bn4 = nn.BatchNorm1d(256)
+        # The output size for each anchor: 1 (confidence) + 1 (center_x) + 1 (width) +  num_classes
+        self.num_outputs_per_anchor = 3+ self.num_classes
+        if cpc_pretrained_path and os.path.exists(cpc_pretrained_path):
+            print(f"Loading CPC pretrained encoder...")
+            print(input_channels)
+            from cpc import EnhancedEncoder1D
+            cpc_encoder = EnhancedEncoder1D(in_channels=input_channels)
+            cpc_state = torch.load(cpc_pretrained_path, map_location=device,weights_only=True)
+            cpc_encoder.load_state_dict(cpc_state, strict=False)
+            self.feature_extractor = cpc_encoder.net
+            print("CPC encoder loaded.")
+        else:
+            self.feature_extractor = nn.Sequential(
+                nn.Conv1d(input_channels, 32, kernel_size=3, padding=1),
+                nn.BatchNorm1d(32),
+                nn.ReLU(),
+                nn.Conv1d(32, 64, kernel_size=3, padding=1),
+                nn.BatchNorm1d(64),
+                nn.ReLU(),
+                nn.Conv1d(64, 128, kernel_size=3, padding=1),
+                nn.BatchNorm1d(128),
+                nn.ReLU(),
+                nn.Conv1d(128, 256, kernel_size=3, padding=1),
+                nn.BatchNorm1d(256),
+                nn.ReLU(),
+            )
         self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(256, num_detectors * num_anchors * self.num_outputs_per_anchor)
 
     def forward(self, x):
-        x = torch.relu(self.bn1(self.conv1(x)))
-        x = torch.relu(self.bn2(self.conv2(x)))
-        x = torch.relu(self.bn3(self.conv3(x)))
-        x = torch.relu(self.bn4(self.conv4(x)))
+        x = self.feature_extractor(x)
         x = self.pool(x).squeeze(-1)
         x = self.fc(x)
         logits = x.view(-1, self.num_detectors, self.num_anchors, self.num_outputs_per_anchor)
-
         return logits
 
 
@@ -398,8 +403,8 @@ class YODALoss(nn.Module):
 
         Each should be a tensor of dimensions (batch_size, # boxes, 3 + num_classes)
         Where the last dimension consists of:
-        [p_c, b_x, b_w,  class_probs]
-        [p_c, t_x, t_w,  c_1, c_2, ..., c_N]
+        [p_c, b_x, b_w, class_probs]
+        [p_c, t_x, t_w, c_1, c_2, ..., c_N]
         and none of the values have been scaled (i.e. raw model output, not passed through sigmoid/etc)
         """
 
@@ -435,6 +440,7 @@ class YODALoss(nn.Module):
             self.lambda_localization * localization_loss_w.sum() +
             classification_loss.sum()
         ) / num_boxes
+
         return total_loss
 
 def compute_iou(gt_start, gt_end, pred_start, pred_end):
@@ -728,7 +734,7 @@ def reconstruct_gt_segments_from_tensor(target_tensor, le, window_size, anchors)
     responsible_anchors = torch.where(target_tensor[..., 0] >0)
     
     for i, j in zip(*responsible_anchors):
-        i, j = i.item(), j.item() # cell index, anchor index
+        i, j = i.item(), j.item()
         
         data = target_tensor[i, j]
         t_x = data[1].item()
@@ -787,7 +793,6 @@ def construct_segments_from_detections(detections, le, window_size,anchors, conf
         overlap range, and the lower one(s) only include their parts that don't overlap.
     """
 
-    # Convert detections into proposed segments based on window and detector sizes:
     num_detectors, num_anchors, _ = detections.shape
     cell_width = window_size / num_detectors
     
@@ -800,8 +805,6 @@ def construct_segments_from_detections(detections, le, window_size,anchors, conf
             p_c = torch.sigmoid(detection[0]).item()
             if p_c < conf_threshold:
                 continue
-            
-            # Decode coordinates
             b_x = torch.sigmoid(detection[1]).item()
             b_w = torch.exp(detection[2]).item() * anchors[j].item()
             
@@ -824,11 +827,9 @@ def construct_segments_from_detections(detections, le, window_size,anchors, conf
     while proposed_segments:
         current_segment = proposed_segments.pop(0)
         final_segments.append(current_segment)
-        
-        # Filter out overlapping segments of the same class
         remaining_segments = []
         for seg in proposed_segments:
-            if seg[3] != current_segment[3]: # Keep if different class
+            if seg[3] != current_segment[3]:
                 remaining_segments.append(seg)
                 continue
             
@@ -857,6 +858,7 @@ def iou(segment1, segment2):
 if __name__ == "__main__":
     test_files = ['gsur2504.csv','gsur2501.csv','gsur2503.csv']
     train_files = ['gsur2510.csv','gsur2511.csv','gsur2514.csv','gsur2505.csv','gsur2506.csv','gsur2507.csv','gsur2509.csv']
+    cpc_pretrained_path = "cpc_trained.pt"
     #train_X, train_Y, label_encoder = load_and_window_data(train_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS,anchors=ANCHOR_BOXES)
     train_X, train_Y, label_encoder = load_and_window_segment(train_files,TARGET,WINDOW_SIZE,STRIDE,'Other')
     train_dataset = YodaSensorDataset(train_X, train_Y)
@@ -865,19 +867,16 @@ if __name__ == "__main__":
     #test_X, test_Y, _ = load_and_window_data(test_files, window_size=WINDOW_SIZE, stride=STRIDE, num_detectors=NUM_DETECTORS, existing_label_encoder=label_encoder)
     #test_dataset = YodaSensorDataset(test_X, test_Y)
     num_classes = len(label_encoder.classes_)
-    model = Yoda(input_channels=train_X.shape[2], num_classes=num_classes, num_detectors=NUM_DETECTORS, num_anchors=NUM_ANCHORS)
+    model = Yoda(input_channels=train_X.shape[2], num_classes=num_classes, num_detectors=NUM_DETECTORS, num_anchors=NUM_ANCHORS,cpc_pretrained_path=cpc_pretrained_path)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    model.to(device)
-    train(model, train_loader, optimizer, YODALoss(), epochs=EPOCHS)
-    #print("evaluate training set")
-    evaluate_plot(model, train_dataset, 'Training', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
-    #print("evaluate testing set")
-    #evaluate_plot(model, test_dataset, 'Testing', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
 
+    model.to(device)
+
+    train(model, train_loader, optimizer, YODALoss(), epochs=EPOCHS)
+    evaluate_plot(model, train_dataset, 'Training', window_size=WINDOW_SIZE, stride=STRIDE, le=label_encoder,anchors=ANCHOR_BOXES)
     all_test_segments = find_all_segments(test_files)
-    # Iterate through each segment and perform evaluation
+
     print("\n--- Evaluating each segment in the test set ---")
-    
     for activity, start, duration in all_test_segments:
         # Ignore "Other" activities
         if activity != TARGET:
@@ -885,8 +884,6 @@ if __name__ == "__main__":
             
         similar_activities = SIMILAR_ACTIVITIES.get(activity, [])
         non_A = 'Other'
-            
-        # Create a temporary, isolated dataset for this segment
         temp_X, temp_Y, temp_le = load_and_window_single_segment(
             test_files, 
             target_activity=activity, 
@@ -898,11 +895,7 @@ if __name__ == "__main__":
         )
         if temp_X is not None:
             temp_dataset = YodaSensorDataset(temp_X, temp_Y)
-            
-            # Since the dataset only contains one window, we need to adjust the print statements
             print(f"\nEvaluating segment: Activity={activity}, Start={start}, Duration={duration}")
-            
-            # Call the evaluation function
             evaluate_plot(
                 model, 
                 temp_dataset, 
@@ -912,6 +905,5 @@ if __name__ == "__main__":
                 le=label_encoder, 
                 anchors=ANCHOR_BOXES
             )
-        
 
     
